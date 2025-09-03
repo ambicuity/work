@@ -306,23 +306,38 @@ class ComprehensiveUniversityScraper:
         org_data['Email'] = self._extract_email(container)
         org_data['Phone Number'] = self._extract_phone(container)
         
+        # If no contact info found in container, try broader search in surrounding content
+        if not org_data['Email'] or not org_data['Phone Number']:
+            parent_container = container.parent if hasattr(container, 'parent') and container.parent else container
+            if hasattr(parent_container, 'get_text'):
+                broader_text = parent_container.get_text()
+                if not org_data['Email']:
+                    org_data['Email'] = self._extract_email_from_text(broader_text)
+                if not org_data['Phone Number']:
+                    org_data['Phone Number'] = self._extract_phone_from_text(broader_text)
+        
         # Extract links and social media
         links = container.find_all('a', href=True) if hasattr(container, 'find_all') else []
+        # Also look in surrounding content for additional links
+        if hasattr(container, 'parent') and container.parent:
+            parent_links = container.parent.find_all('a', href=True) if hasattr(container.parent, 'find_all') else []
+            links.extend(parent_links)
+        
         for link in links:
             href = link.get('href', '').lower()
             full_url = urljoin(base_url, link.get('href', ''))
             
-            if 'facebook' in href:
+            if 'facebook' in href and not org_data['Facebook Link']:
                 org_data['Facebook Link'] = full_url
-            elif 'twitter' in href or 'x.com' in href:
+            elif ('twitter' in href or 'x.com' in href) and not org_data['Twitter Link']:
                 org_data['Twitter Link'] = full_url  
-            elif 'instagram' in href:
+            elif 'instagram' in href and not org_data['Instagram Link']:
                 org_data['Instagram Link'] = full_url
-            elif 'linkedin' in href:
+            elif 'linkedin' in href and not org_data['Linkedin Link']:
                 org_data['Linkedin Link'] = full_url
-            elif 'youtube' in href:
+            elif 'youtube' in href and not org_data['Youtube Link']:
                 org_data['Youtube Link'] = full_url
-            elif 'tiktok' in href:
+            elif 'tiktok' in href and not org_data['Tiktok Link']:
                 org_data['Tiktok Link'] = full_url
             elif href and not href.startswith('#') and not href.startswith('javascript') and not org_data['Organization Link']:
                 if not self._is_external_link(href, base_url):
@@ -332,10 +347,25 @@ class ComprehensiveUniversityScraper:
         if not org_data['Organization Link']:
             org_data['Organization Link'] = base_url
         
-        # Extract image/logo
+        # Extract image/logo - try multiple strategies
         img = container.find('img') if hasattr(container, 'find') else None
         if img and img.get('src'):
             org_data['Logo Link'] = urljoin(base_url, img.get('src'))
+        else:
+            # Try finding images in parent container
+            if hasattr(container, 'parent') and container.parent:
+                parent_img = container.parent.find('img') if hasattr(container.parent, 'find') else None
+                if parent_img and parent_img.get('src'):
+                    org_data['Logo Link'] = urljoin(base_url, parent_img.get('src'))
+            
+            # Look for common logo patterns
+            if not org_data['Logo Link'] and hasattr(container, 'find'):
+                logo_selectors = ['img[alt*="logo"]', '.logo img', '.icon img', 'img[src*="logo"]']
+                for selector in logo_selectors:
+                    logo_img = container.find(selector)
+                    if logo_img and logo_img.get('src'):
+                        org_data['Logo Link'] = urljoin(base_url, logo_img.get('src'))
+                        break
         
         # Determine category
         org_data['Category'] = self._determine_category(name, org_data['Description'])
@@ -441,28 +471,44 @@ class ComprehensiveUniversityScraper:
         return ""
     
     def _extract_description(self, container) -> str:
-        """Extract organization description"""
+        """Extract organization description with enhanced strategies"""
         if not hasattr(container, 'find'):
             return ""
         
-        # Look for description elements
-        desc_selectors = ['.description', '.summary', '.about', 'p', '.content', '.details']
+        # Look for description elements with more selectors
+        desc_selectors = [
+            '.description', '.summary', '.about', '.overview', '.content', 
+            '.details', '.info', '.mission', '.purpose', 'p', '.text',
+            '.excerpt', '.intro', '.profile'
+        ]
         
+        # Try each selector in order of preference
         for selector in desc_selectors:
-            element = container.find(selector)
-            if element:
+            elements = container.find_all(selector)
+            for element in elements:
                 desc = element.get_text(strip=True)
-                if len(desc) > 10:
-                    return desc[:800]  # Limit length
+                # Look for substantial descriptions
+                if len(desc) > 20 and len(desc) < 1000:
+                    # Skip if it looks like navigation or boilerplate
+                    if not any(skip in desc.lower() for skip in ['click here', 'read more', 'learn more', 'contact', 'home', 'about us']):
+                        return desc[:800]  # Limit length
         
         # Get text from container, skip the first line (likely name)
         full_text = container.get_text(strip=True)
         lines = [line.strip() for line in full_text.split('\n') if line.strip()]
         
         if len(lines) > 1:
-            # Join lines after the first one
-            desc = ' '.join(lines[1:])
-            if len(desc) > 10:
+            # Join lines after the first one, looking for substantial content
+            desc_lines = []
+            for line in lines[1:]:
+                # Skip lines that are just links or navigation
+                if len(line) > 10 and not line.lower().startswith(('http', 'www', 'click', 'read more')):
+                    desc_lines.append(line)
+                if len(' '.join(desc_lines)) > 100:  # Stop when we have enough
+                    break
+            
+            desc = ' '.join(desc_lines)
+            if len(desc) > 20:
                 return desc[:800]
         
         return ""
@@ -473,14 +519,39 @@ class ComprehensiveUniversityScraper:
         return self._extract_email_from_text(text)
     
     def _extract_email_from_text(self, text: str) -> str:
-        """Extract email from text"""
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text)
-        # Filter out common non-organizational emails
-        for email in emails:
-            if not any(skip in email.lower() for skip in ['noreply', 'webmaster', 'admin', 'info@university', 'support']):
-                return email
-        return emails[0] if emails else ""
+        """Extract email from text with enhanced patterns"""
+        # Multiple email patterns to catch different formats
+        email_patterns = [
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Standard email
+            r'\b[A-Za-z0-9._%+-]+\s*\[at\]\s*[A-Za-z0-9.-]+\s*\[dot\]\s*[A-Za-z]{2,}\b',  # Obfuscated email
+            r'\b[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}\b',  # Spaced email
+        ]
+        
+        all_emails = []
+        for pattern in email_patterns:
+            emails = re.findall(pattern, text, re.IGNORECASE)
+            all_emails.extend(emails)
+        
+        # Clean up obfuscated emails
+        cleaned_emails = []
+        for email in all_emails:
+            # Convert obfuscated format back to normal
+            cleaned = email.replace('[at]', '@').replace('[dot]', '.').replace(' ', '')
+            cleaned_emails.append(cleaned)
+        
+        # Filter out common non-organizational emails and prioritize
+        filtered_emails = []
+        skip_patterns = ['noreply', 'webmaster', 'admin@university', 'support@university', 'info@example']
+        
+        for email in cleaned_emails:
+            if not any(skip in email.lower() for skip in skip_patterns):
+                # Prioritize organization-specific emails
+                if any(term in email.lower() for term in ['student', 'club', 'org', 'group', 'society']):
+                    filtered_emails.insert(0, email)  # Put at front
+                else:
+                    filtered_emails.append(email)
+        
+        return filtered_emails[0] if filtered_emails else ""
     
     def _extract_phone(self, container) -> str:
         """Extract phone number"""
@@ -488,17 +559,23 @@ class ComprehensiveUniversityScraper:
         return self._extract_phone_from_text(text)
     
     def _extract_phone_from_text(self, text: str) -> str:
-        """Extract phone number from text"""
+        """Extract phone number from text with enhanced patterns"""
         phone_patterns = [
-            r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
-            r'\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
-            r'\d{3}[-.\s]?\d{3}[-.\s]?\d{4}'
+            r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # Standard US format
+            r'\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # US with country code
+            r'\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',  # Simple format
+            r'\d{3}\.\d{3}\.\d{4}',  # Dot separated
+            r'\d{10}',  # Just digits (if exactly 10)
         ]
         
         for pattern in phone_patterns:
             phones = re.findall(pattern, text)
             if phones:
-                return phones[0]
+                # Clean up the phone number
+                phone = phones[0].strip()
+                # Skip obviously invalid numbers
+                if len(re.sub(r'[^\d]', '', phone)) == 10:
+                    return phone
         return ""
     
     def _is_likely_organization_name(self, text: str) -> bool:
